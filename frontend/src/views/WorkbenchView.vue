@@ -28,6 +28,45 @@
       </span>
     </p>
 
+    <section v-if="isStorageTier" class="handoff-panel" data-testid="handoff-panel">
+      <header class="handoff-head">
+        <h3>冷文件交接包</h3>
+        <p class="page-desc">
+          按快照导出迁移清单只用冷层文件作为迁移对象；回执确认后读取位置才切到校验过的冷副本。
+        </p>
+      </header>
+      <div class="handoff-actions">
+        <input v-model="handoff.lakeTable" data-testid="handoff-lake-table" placeholder="湖表名" />
+        <input v-model="handoff.snapshotId" data-testid="handoff-snapshot" placeholder="快照标识" />
+        <button class="btn" data-testid="handoff-export" type="button" @click="exportHandoffManifest">
+          导出迁移清单
+        </button>
+      </div>
+      <p v-if="handoff.message" class="error-text" data-testid="handoff-message">{{ handoff.message }}</p>
+      <article v-if="handoff.manifest" class="handoff-card" data-testid="handoff-manifest">
+        <strong>{{ handoff.manifest.manifest_id }}</strong>
+        <span>快照 {{ handoff.manifest.snapshot_id }}</span>
+        <span>迁移对象 {{ handoff.manifest.entry_count }} 个冷层文件</span>
+        <ul>
+          <li v-for="entry in handoff.manifest.entries" :key="entry.file_id">
+            {{ entry.file_id }} · 分区 {{ entry.partition_key }} · {{ entry.file_rows }} 行 ·
+            导出时读取位置 {{ entry.read_location }}
+          </li>
+        </ul>
+        <div class="page-actions">
+          <button class="btn" data-testid="handoff-download" type="button" @click="downloadHandoffManifest">
+            下载交接包
+          </button>
+          <button class="btn" data-testid="handoff-reconcile" type="button" @click="reconcileHandoffManifest">
+            分层对账
+          </button>
+        </div>
+        <p v-if="handoff.reconcileMessage" class="error-text" data-testid="handoff-reconcile-message">
+          {{ handoff.reconcileMessage }}
+        </p>
+      </article>
+    </section>
+
     <form class="filter-bar" @submit.prevent="reload">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
@@ -99,14 +138,18 @@ import { computed, onMounted, ref } from 'vue'
 import {
   createEntry,
   downloadEntries,
+  downloadMigrationManifest,
+  exportMigrationManifest,
   listEntries,
   moduleMeta,
+  reconcileMigrationManifest,
   runAction as applyAction,
 } from '@/api/backend-service'
-import type { EntryRow } from '@/data/types'
+import type { EntryRow, MigrationManifestView } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+const isStorageTier = props.moduleKey === 'storage_tier'
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
@@ -115,6 +158,13 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const handoff = ref<{
+  lakeTable: string
+  snapshotId: string
+  manifest: MigrationManifestView | null
+  message: string
+  reconcileMessage: string
+}>({ lakeTable: '', snapshotId: '', manifest: null, message: '', reconcileMessage: '' })
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
@@ -148,6 +198,38 @@ function openCreate() {
   createValues.value = Object.fromEntries(meta.fields.map((field) => [field, '']))
   errorMessage.value = ''
   showCreate.value = true
+}
+
+async function exportHandoffManifest() {
+  handoff.value.message = ''
+  handoff.value.reconcileMessage = ''
+  try {
+    handoff.value.manifest = await exportMigrationManifest({
+      lake_table: handoff.value.lakeTable.trim(),
+      snapshot_id: handoff.value.snapshotId.trim(),
+    })
+  } catch (error) {
+    handoff.value.manifest = null
+    handoff.value.message = error instanceof Error ? error.message : '导出迁移清单失败'
+  }
+}
+
+function downloadHandoffManifest() {
+  if (!handoff.value.manifest) return
+  downloadMigrationManifest(handoff.value.manifest.manifest_id)
+}
+
+async function reconcileHandoffManifest() {
+  if (!handoff.value.manifest) return
+  handoff.value.reconcileMessage = ''
+  try {
+    const result = await reconcileMigrationManifest(handoff.value.manifest.manifest_id)
+    handoff.value.reconcileMessage = result.already_reconciled
+      ? `已在 ${result.total_reconciled} 字节处核销过，本次不重复核销`
+      : `本次核销 ${result.reconciled_now} 字节`
+  } catch (error) {
+    handoff.value.reconcileMessage = error instanceof Error ? error.message : '分层对账失败'
+  }
 }
 
 async function submitCreate() {

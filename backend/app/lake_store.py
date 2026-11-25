@@ -36,6 +36,90 @@ class PartitionFile:
     file_bytes: int
     file_manifest: str  # 文件内容摘要（MD5）
     created_at: float
+    # hot | cold | auto；auto 时按创建时间与热层天数判定（兼容历史调用）
+    tier: str = "auto"
+
+
+# ----------------------------- 冷层迁移交接 -----------------------------
+
+@dataclass
+class MigrationManifestEntry:
+    """迁移清单条目：导出瞬间冻结的分区与文件身份，后续不得跟随文件变化。"""
+    file_id: str
+    lake_table: str
+    partition_key: str
+    file_rows: int
+    file_bytes: int
+    file_manifest: str
+    tier: str = "cold"
+    read_location: str = "hot"  # 导出时该文件的读取位置
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "file_id": self.file_id,
+            "lake_table": self.lake_table,
+            "partition_key": self.partition_key,
+            "file_rows": self.file_rows,
+            "file_bytes": self.file_bytes,
+            "file_manifest": self.file_manifest,
+            "tier": self.tier,
+            "read_location": self.read_location,
+        }
+
+
+@dataclass
+class MigrationManifest:
+    """按快照导出的冷文件交接包清单。"""
+    manifest_id: str
+    lake_table: str
+    snapshot_id: str
+    entries: list[MigrationManifestEntry]
+    compression: str
+    created_at: float
+
+
+@dataclass
+class ColdCopy:
+    """冷端副本：记录从冷端校验过的内容摘要与可回读的行/分区信息。"""
+    lake_table: str
+    file_id: str
+    partition_key: str
+    file_rows: int
+    file_bytes: int
+    copy_checksum: str
+    source_snapshot: str | None
+    verified: bool
+    verified_at: float | None
+
+
+@dataclass
+class MigrationReceipt:
+    """迁移接收回执：同一份回执可重复投递，但只确认/核销一次。"""
+    receipt_id: str
+    manifest_id: str
+    lake_table: str
+    file_id: str
+    content_checksum: str
+    status: str  # confirmed | rejected
+    reason: str
+    submitted_at: float
+    confirmed_at: float | None
+    submission_count: int = 1
+
+
+@dataclass
+class ReleaseRequest:
+    """旧位置释放申请：由发起端记录，确认归属后由接手端执行。"""
+    request_id: str
+    lake_table: str
+    file_id: str
+    requested_by: str  # hot
+    owner: str  # hot | cold
+    status: str  # pending | taken_over_by_cold | completed | rejected
+    created_at: float
+    updated_at: float
+    original_released: bool
+    reason: str
 
 
 # ----------------------------- 快照 -----------------------------
@@ -148,10 +232,19 @@ class LakeStore:
         # 归并中断恢复检查点：merge_id -> {partial_file_ids: [...], ...}
         self._merge_checkpoints: dict[str, dict[str, Any]] = {}
 
+        # 冷层迁移：交接包清单 / 冷端副本 / 接收回执 / 释放申请
+        self._migration_manifests: dict[str, MigrationManifest] = {}
+        self._cold_copies: dict[tuple[str, str], ColdCopy] = {}
+        self._migration_receipts: dict[str, MigrationReceipt] = {}
+        self._release_requests: dict[str, ReleaseRequest] = {}
+        # 已核销的迁移字节：manifest_id -> 已核销字节，保证同一份清单只核销一次
+        self._reconciled_manifests: dict[str, int] = {}
+
     # ---- 文件操作 ----
 
     def register_file(
-        self, lake_table: str, partition_key: str, rows: int, bytes_: int, manifest: str | None = None
+        self, lake_table: str, partition_key: str, rows: int, bytes_: int,
+        manifest: str | None = None, tier: str = "auto",
     ) -> PartitionFile:
         file_id = f"{lake_table}-p{partition_key}-{uuid.uuid4().hex[:8]}"
         checksum = manifest or hashlib.md5(f"{lake_table}:{partition_key}:{time.time()}".encode()).hexdigest()
@@ -163,9 +256,19 @@ class LakeStore:
             file_bytes=bytes_,
             file_manifest=checksum,
             created_at=time.time(),
+            tier=tier,
         )
         self._files.setdefault(lake_table, {})[file_id] = pf
         return pf
+
+    def is_hot(self, pf: PartitionFile, hot_days: int = 7, now: float | None = None) -> bool:
+        """判定文件属于热层还是冷层：显式 tier 优先，否则按创建时间。"""
+        if pf.tier == "hot":
+            return True
+        if pf.tier == "cold":
+            return False
+        current = time.time() if now is None else now
+        return (current - pf.created_at) / 86400 <= hot_days
 
     def list_files(self, lake_table: str, partition_key: str | None = None) -> list[PartitionFile]:
         files = list(self._files.get(lake_table, {}).values())
@@ -384,6 +487,246 @@ class LakeStore:
 
     def clear_merge_checkpoint(self, merge_id: str) -> None:
         self._merge_checkpoints.pop(merge_id, None)
+
+    # ---- 冷层迁移交接 ----
+
+    def export_migration_manifest(
+        self, manifest_id: str, lake_table: str, snapshot_id: str,
+        compression: str = "SNAPPY", hot_days: int = 7,
+    ) -> MigrationManifest:
+        """按快照导出冷文件迁移清单：只收录该快照中属于冷层的文件。
+
+        清单在导出瞬间冻结文件身份（file_id/分区/行数/字节/摘要），
+        之后即使文件体积、位置发生变化，清单内容仍可核对当时的准备对象。
+        """
+        snap = self.get_snapshot(lake_table, snapshot_id)
+        if snap is None:
+            raise KeyError(f"快照不存在：{snapshot_id}")
+        if snap.lake_table != lake_table:
+            raise PermissionError(
+                f"快照 {snapshot_id} 不属于湖表 {lake_table}，不能作为该湖表的迁移来源")
+        entries: list[MigrationManifestEntry] = []
+        for fid in snap.file_ids:
+            pf = self.get_file(lake_table, fid)
+            if pf is None:
+                continue
+            if self.is_hot(pf, hot_days=hot_days):
+                continue
+            entries.append(MigrationManifestEntry(
+                file_id=pf.file_id,
+                lake_table=pf.lake_table,
+                partition_key=pf.partition_key,
+                file_rows=pf.file_rows,
+                file_bytes=pf.file_bytes,
+                file_manifest=pf.file_manifest,
+                tier="cold",
+                read_location="hot",
+            ))
+        manifest = MigrationManifest(
+            manifest_id=manifest_id,
+            lake_table=lake_table,
+            snapshot_id=snapshot_id,
+            entries=entries,
+            compression=compression,
+            created_at=time.time(),
+        )
+        self._migration_manifests[manifest_id] = manifest
+        return manifest
+
+    def get_migration_manifest(self, manifest_id: str) -> MigrationManifest | None:
+        return self._migration_manifests.get(manifest_id)
+
+    def list_migration_manifests(self, lake_table: str | None = None) -> list[MigrationManifest]:
+        manifests = list(self._migration_manifests.values())
+        if lake_table is not None:
+            manifests = [m for m in manifests if m.lake_table == lake_table]
+        return manifests
+
+    def register_cold_copy(
+        self, lake_table: str, file_id: str, partition_key: str,
+        rows: int, bytes_: int, copy_checksum: str,
+        source_snapshot: str | None = None, verified: bool = False,
+    ) -> ColdCopy:
+        """登记冷端副本；校验通过后 verified=True，可作为回读来源。"""
+        now = time.time()
+        copy = ColdCopy(
+            lake_table=lake_table,
+            file_id=file_id,
+            partition_key=partition_key,
+            file_rows=rows,
+            file_bytes=bytes_,
+            copy_checksum=copy_checksum,
+            source_snapshot=source_snapshot,
+            verified=verified,
+            verified_at=now if verified else None,
+        )
+        self._cold_copies[(lake_table, file_id)] = copy
+        return copy
+
+    def get_cold_copy(self, lake_table: str, file_id: str) -> ColdCopy | None:
+        return self._cold_copies.get((lake_table, file_id))
+
+    def list_cold_copies(self, lake_table: str) -> list[ColdCopy]:
+        return [c for (lk, _fid), c in self._cold_copies.items() if lk == lake_table]
+
+    def find_cold_copy_by_checksum(
+        self, lake_table: str, partition_key: str, copy_checksum: str,
+    ) -> ColdCopy | None:
+        """按分区与内容摘要定位冷端副本，用于校验回执内容是否可信。"""
+        for copy in self.list_cold_copies(lake_table):
+            if copy.partition_key == partition_key and copy.copy_checksum == copy_checksum:
+                return copy
+        return None
+
+    def submit_migration_receipt(
+        self, receipt_id: str, manifest_id: str, lake_table: str, file_id: str,
+        content_checksum: str,
+    ) -> MigrationReceipt:
+        """投递接收回执：同一 receipt_id 重复投递时只累加次数，状态以首次确认为准。"""
+        existing = self._migration_receipts.get(receipt_id)
+        if existing is not None:
+            existing.submission_count += 1
+            return existing
+        receipt = MigrationReceipt(
+            receipt_id=receipt_id,
+            manifest_id=manifest_id,
+            lake_table=lake_table,
+            file_id=file_id,
+            content_checksum=content_checksum,
+            status="pending",
+            reason="",
+            submitted_at=time.time(),
+            confirmed_at=None,
+        )
+        self._migration_receipts[receipt_id] = receipt
+        return receipt
+
+    def get_migration_receipt(self, receipt_id: str) -> MigrationReceipt | None:
+        return self._migration_receipts.get(receipt_id)
+
+    def list_migration_receipts(self, manifest_id: str | None = None) -> list[MigrationReceipt]:
+        receipts = list(self._migration_receipts.values())
+        if manifest_id is not None:
+            receipts = [r for r in receipts if r.manifest_id == manifest_id]
+        return receipts
+
+    def confirm_migration_receipt(
+        self, receipt_id: str, accepted: bool, reason: str = "",
+    ) -> MigrationReceipt | None:
+        """确认回执结果；已确认的回执不会被二次确认改写。"""
+        receipt = self._migration_receipts.get(receipt_id)
+        if receipt is None:
+            return None
+        if receipt.status != "pending":
+            return receipt
+        receipt.status = "confirmed" if accepted else "rejected"
+        receipt.reason = reason
+        receipt.confirmed_at = time.time()
+        return receipt
+
+    def file_belongs_to_other_table(self, lake_table: str, file_id: str) -> bool:
+        """回执里的文件标识是否实际归属另一张湖表。"""
+        for (lk, fid), _copy in self._cold_copies.items():
+            if fid == file_id and lk != lake_table:
+                return True
+        for other_table, files in self._files.items():
+            if other_table != lake_table and file_id in files:
+                return True
+        return False
+
+    def open_release_request(
+        self, request_id: str, lake_table: str, file_id: str,
+        requested_by: str = "hot", reason: str = "",
+    ) -> ReleaseRequest:
+        """发起旧位置释放申请；归属在确认回执后由核验结果决定。"""
+        now = time.time()
+        request = ReleaseRequest(
+            request_id=request_id,
+            lake_table=lake_table,
+            file_id=file_id,
+            requested_by=requested_by,
+            owner=requested_by,
+            status="pending",
+            created_at=now,
+            updated_at=now,
+            original_released=False,
+            reason=reason,
+        )
+        self._release_requests[request_id] = request
+        return request
+
+    def get_release_request(self, request_id: str) -> ReleaseRequest | None:
+        return self._release_requests.get(request_id)
+
+    def list_release_requests(self, lake_table: str, file_id: str | None = None) -> list[ReleaseRequest]:
+        requests = [r for r in self._release_requests.values() if r.lake_table == lake_table]
+        if file_id is not None:
+            requests = [r for r in requests if r.file_id == file_id]
+        return requests
+
+    def hand_over_release_request(self, request_id: str, owner: str, reason: str = "") -> ReleaseRequest | None:
+        """把释放申请移交给实际持有文件的一端；旧位置不因申请而立即释放。"""
+        request = self._release_requests.get(request_id)
+        if request is None:
+            return None
+        request.owner = owner
+        request.status = "taken_over_by_cold" if owner == "cold" else "pending"
+        request.updated_at = time.time()
+        if reason:
+            request.reason = reason
+        return request
+
+    def settle_release_request(self, request_id: str, completed: bool, reason: str = "") -> ReleaseRequest | None:
+        """结清释放申请：由接手端执行后才释放原位置。"""
+        request = self._release_requests.get(request_id)
+        if request is None:
+            return None
+        request.status = "completed" if completed else "rejected"
+        request.original_released = completed
+        request.updated_at = time.time()
+        if reason:
+            request.reason = reason
+        return request
+
+    def record_manifest_reconciliation(self, manifest_id: str, migrated_bytes: int) -> int:
+        """登记清单已核销的迁移字节；同一份清单只核销一次，返回本次实际核销字节。"""
+        if manifest_id in self._reconciled_manifests:
+            return 0
+        self._reconciled_manifests[manifest_id] = migrated_bytes
+        return migrated_bytes
+
+    def get_manifest_reconciliation(self, manifest_id: str) -> int | None:
+        return self._reconciled_manifests.get(manifest_id)
+
+    def resolve_read_location(self, lake_table: str, file_id: str) -> dict[str, Any]:
+        """解析文件当前的实际读取位置，供时间旅行核对迁移前后读取位置。
+
+        优先级：已确认迁移且冷副本校验通过 -> 冷端；
+        否则回退热端原位置（只要文件仍在注册表里）。
+        """
+        copy = self.get_cold_copy(lake_table, file_id)
+        file = self.get_file(lake_table, file_id)
+        confirmed = any(
+            r.status == "confirmed" and r.file_id == file_id and r.lake_table == lake_table
+            for r in self._migration_receipts.values()
+        )
+        if copy is not None and copy.verified and confirmed:
+            return {
+                "file_id": file_id,
+                "read_location": "cold",
+                "cold_copy_verified": True,
+                "original_present": file is not None,
+                "original_retained": file is not None,
+                "original_released": file is None,
+            }
+        return {
+            "file_id": file_id,
+            "read_location": "hot" if file is not None else "missing",
+            "cold_copy_verified": bool(copy and copy.verified),
+            "original_present": file is not None,
+            "original_retained": file is not None,
+            "original_released": file is None and copy is not None,
+        }
 
     # ---- 并发写锁 ----
 

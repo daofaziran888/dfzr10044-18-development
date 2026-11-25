@@ -81,5 +81,28 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 冷层迁移交接（存储分层）
+
+只有冷层文件可以被列为迁移对象；热层文件即使与冷文件同分区同快照，也不会进入交接包。
+
+| 接口 | 说明 |
+| --- | --- |
+| `POST /api/storage_tier/manifests/export` | 按快照导出迁移清单，条目冻结导出时的分区与文件身份 |
+| `GET /api/storage_tier/manifests/{id}/download` | 下载交接包 CSV（清单 + 回执状态） |
+| `POST /api/storage_tier/cold-copies/verify` | 从冷端校验副本内容摘要 |
+| `POST /api/storage_tier/receipts` | 投递接收回执；同一回执重复投递只确认一次，`defer=true` 表示确认迟到 |
+| `GET /api/storage_tier/unconfirmed` | 未确认列表：回执归属其它湖表或内容无法校验时仍留在此列 |
+| `GET /api/storage_tier/read-location` | 核对文件当前在原位置还是校验过的冷副本 |
+| `POST /api/storage_tier/release-requests/{id}/handover` | 回执确认后旧位置释放申请交给冷端接手 |
+| `POST /api/storage_tier/release-requests/{id}/settle` | 冷端结清后才释放原位置 |
+| `POST /api/storage_tier/manifests/{id}/reconcile` | 分层对账，同一份清单只核销一次已迁字节 |
+| `POST /api/time_travel/read` | 回溯旧快照，返回每个文件迁移前后的读取位置 |
+
+语义要点：
+- 回执未确认时，旧快照仍从热端原位置回读（H、C 均可见）；确认后才切到校验过的冷副本。
+- 原位置释放申请由热端发起，确认后由冷端接手；接手前调用结清会被拒绝（409）。
+- 原位置释放后，只要冷副本已校验，旧快照仍可回退到冷副本读取，不会丢行。
+- 已导出的清单不随后续压缩、迁层或释放变化，可继续核对当时准备迁移的分区和文件身份。
+
 领域：数据工程
 子方向：数仓与数据湖
